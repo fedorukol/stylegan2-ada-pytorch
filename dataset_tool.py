@@ -21,6 +21,7 @@ from typing import Callable, Optional, Tuple, Union
 import click
 import numpy as np
 import PIL.Image
+import torch
 from tqdm import tqdm
 
 #----------------------------------------------------------------------------
@@ -194,6 +195,29 @@ def open_mnist(images_gz: str, *, max_images: Optional[int]):
 
     return max_idx, iterate_images()
 
+
+def open_medmnist(images_gz: str, *, max_images: Optional[int]):
+    if not images_gz:
+        images_gz = './medmnist/vesselmnist3d.npz'
+    images = np.load(images_gz)['train_images']
+    labels = np.load(images_gz)['train_labels']
+    labels = labels.reshape(labels.shape[0])
+    images = np.pad(images, [(0,0), (2, 2), (2, 2), (2, 2)], 'constant', constant_values=0)
+    assert images.shape == (images.shape[0], 32, 32, 32) and images.dtype == np.uint8
+    assert labels.shape == (labels.shape[0],) and labels.dtype == np.uint8
+    assert np.min(images) == 0 and np.max(images) == 255
+    assert np.min(labels) == 0 and np.max(labels) == 1
+
+    max_idx = maybe_min(len(images), max_images)
+
+    def iterate_images():
+        for idx, img in enumerate(images):
+            yield dict(img=img, label=int(labels[idx]))
+            if idx >= max_idx-1:
+                break
+
+    return max_idx, iterate_images()
+
 #----------------------------------------------------------------------------
 
 def make_transform(
@@ -260,6 +284,8 @@ def open_dataset(source, *, max_images: Optional[int]):
             return open_cifar10(source, max_images=max_images)
         elif os.path.basename(source) == 'train-images-idx3-ubyte.gz':
             return open_mnist(source, max_images=max_images)
+        elif 'mnist' in os.path.basename(source):
+            return open_medmnist(source, max_images=max_images)
         elif file_ext(source) == 'zip':
             return open_image_zip(source, max_images=max_images)
         else:
@@ -379,7 +405,7 @@ def convert_dataset(
         --transform=center-crop-wide --width 512 --height=384
     """
 
-    PIL.Image.init() # type: ignore
+    # PIL.Image.init() # type: ignore
 
     if dest == '':
         ctx.fail('--dest output filename or directory must not be an empty string')
@@ -387,17 +413,18 @@ def convert_dataset(
     num_files, input_iter = open_dataset(source, max_images=max_images)
     archive_root_dir, save_bytes, close_dest = open_dest(dest)
 
-    transform_image = make_transform(transform, width, height, resize_filter)
+    # transform_image = make_transform(transform, width, height, resize_filter)
 
     dataset_attrs = None
 
     labels = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
         idx_str = f'{idx:08d}'
-        archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
+        archive_fname = f'{idx_str[:5]}/img{idx_str}.pt'
 
         # Apply crop and resize.
-        img = transform_image(image['img'])
+        img = image['img']
+        # img = transform_image(image['img'])
 
         # Transform may drop images.
         if img is None:
@@ -405,18 +432,22 @@ def convert_dataset(
 
         # Error check to require uniform image attributes across
         # the whole dataset.
-        channels = img.shape[2] if img.ndim == 3 else 1
+        print(img.ndim)
+        print(img.shape)
+        channels = img.shape[3] if img.ndim == 4 else 1
         cur_image_attrs = {
+            'depth': img.shape[2],
             'width': img.shape[1],
             'height': img.shape[0],
             'channels': channels
         }
         if dataset_attrs is None:
             dataset_attrs = cur_image_attrs
+            depth = dataset_attrs['depth']
             width = dataset_attrs['width']
             height = dataset_attrs['height']
             if width != height:
-                error(f'Image dimensions after scale and crop are required to be square.  Got {width}x{height}')
+                error(f'Image dimensions after scale and crop are required to be square.  Got {width}x{height}x{depth}')
             if dataset_attrs['channels'] not in [1, 3]:
                 error('Input images must be stored as RGB or grayscale')
             if width != 2 ** int(np.floor(np.log2(width))):
@@ -426,11 +457,11 @@ def convert_dataset(
             error(f'Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n' + '\n'.join(err))
 
         # Save the image as an uncompressed PNG.
-        img = PIL.Image.fromarray(img, { 1: 'L', 3: 'RGB' }[channels])
+        image_tensor = torch.from_numpy(img)
         image_bits = io.BytesIO()
-        img.save(image_bits, format='png', compress_level=0, optimize=False)
-        save_bytes(os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
-        labels.append([archive_fname, image['label']] if image['label'] is not None else None)
+        torch.save(image_tensor, image_bits)
+        save_bytes(os.path.join(archive_root_dir, archive_fname + '.pt'), image_bits.getvalue())
+        labels.append([archive_fname + '.pt', image['label']] if image['label'] is not None else None)
 
     metadata = {
         'labels': labels if all(x is not None for x in labels) else None
